@@ -2,18 +2,7 @@
 ## Introduction
 Download erosita data:
 
-cone search example: https://sciserver.mpe.mpg.de/erosita-services/conesearch/observation/get?ra=135&dec=1&r=1&runit=deg&format=json
-
-ra, dec must in degree
-
-Set cone radius to 0.01 and unit of arcsec. So that the target would definitely be covered.
-
-Note that ra, dec for website have maximum four float digits.
-
-Response:
-
-1. No corresponding observations: 'No results in area'
-2. Having observations: json file
+Download eROSITA Early Data Release for give R.A. and Dec in degree.
 
 Data reduction and analysis:
 1. merge events and image file
