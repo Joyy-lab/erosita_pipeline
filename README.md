@@ -21,11 +21,11 @@ Data reduction:
 3. exposure and PSF map generation
 4. light curve and spectrum extraction and analysis
 ## Usage
-1. erosita_pipeline --help to get infomation of arguments
-2. erosita_pipeline ra dec
+1. ./erosita_pipeline --help to get infomation of arguments
+2. ./erosita_pipeline ra dec
 
 Download data and reduce
 
-3. erosita_pipeline ra dec --without-reduction
+3. ./erosita_pipeline ra dec --without-reduction
 
 Forbid reduction and download 
