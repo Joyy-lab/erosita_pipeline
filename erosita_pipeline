@@ -1,0 +1,592 @@
+#!/usr/bin/env python
+'''
+Download erosita data:
+cone search example: https://sciserver.mpe.mpg.de/erosita-services/conesearch/observation/get?ra=135&dec=1&r=1&runit=deg&format=json
+ra, dec must in degree
+set cone radius to 0.01 and unit of arcsec. So that the target would definitely be covered.
+note that ra, dec for website have maximum four float digits.
+Response:
+1. No corresponding observations: 'No results in area'
+2. Having observations: json file
+
+Data reduction:
+1. merge events and image file
+2. source detection and catalog production
+3. exposure and PSF map generation
+4. light curve and spectrum extraction and analysis
+'''
+
+import os
+import requests
+import json
+import sys
+from argparse import ArgumentParser
+from astropy.table import Table, QTable
+from astropy.time import Time
+import astropy.units as u
+from astropy.coordinates import SkyCoord
+from astropy.wcs import WCS
+from astropy.io import fits
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import Rbf
+
+def write_summary(string):
+    if os.path.isfile(SUMMARY):
+        fp = open(SUMMARY, 'a+')
+    else:
+        fp = open(SUMMARY, 'w+')
+    fp.write(string)
+    fp.close()
+    print(string.strip())
+
+def check_exist(file):
+    '''
+    Check and remove existed file.
+    '''
+    if os.path.isfile(file):
+        os.remove(file)
+
+def erosita_download(RA, DEC, r=0.01, runit='arcsec'):
+    '''
+    Download observation file for given coordinates.
+    RA DEC, float, coordinate in degree
+    r, float, cone search radius
+    runit, string, cone search radius unit
+    '''
+    url_format = "https://sciserver.mpe.mpg.de/erosita-services/conesearch/observation/get?ra={0:.4f}&dec={1:.4f}&r={2:.2f}&runit={3}&format=json"
+    fileroot = os.getcwd()
+    os.chdir(fileroot)
+    params = {'ra':RA, 'dec':DEC, 'r':r, 'runit':runit}
+    headers = {'User-Agent' : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36'}
+    url = url_format.format(RA, DEC, r, runit)
+    response = requests.get(url, headers=headers)
+
+    resp = response.text
+    try:
+        global OBS_DICT
+        data = json.loads(resp)
+        OBS_COUNT = len(data)
+        OBS_ID = []
+        OBS_DICT = {}
+        fileurl_list = []
+        fieldid_list = []
+        write_summary(f'''Find {OBS_COUNT} observations:
+{'ObsID':^6} {'RA':^6} {'Dec':^6} {'StartTime':^19} {'EndTime':^19} {'Mode':^8} \n''')
+        for idx in range(OBS_COUNT):
+            obs_info = data[idx]
+            OBS_ID.append(obs_info['OBS_ID'])
+            fileurl_list.append(obs_info['fileURL'])
+            fieldid_list.append(obs_info['fieldID'])
+            OBS_DICT[obs_info['OBS_ID']] = {'OBS_ID':obs_info['OBS_ID'], 
+                                'RA':obs_info['RA_PNT'], 
+                                'DEC':obs_info['DEC_PNT'], 
+                                'DATE_OBS':obs_info['DATE-OBS'], 
+                                'DATE_END':obs_info['DATE-END'],
+                                'OBS_MODE':obs_info['OBS_MODE'],
+                                'fieldID':obs_info['fieldID']}
+            write_summary(f" {obs_info['OBS_ID']} {obs_info['RA_PNT']:^6.2f} {obs_info['DEC_PNT']:^6.2f} {obs_info['DATE-OBS']}  {obs_info['DATE-END']}  {obs_info['OBS_MODE']} \n")
+    except Exception as err:
+        if resp == 'No results in area':
+            write_summary('No observations for given coordinates.\n')
+            write_summary('========== Exit ==========\n')
+            sys.exit('No observations for given coordinates.')
+        else:
+            write_summary('Error: cannot get observation information\n')            
+            write_summary('========== Exit ==========\n')
+            sys.exit(resp)
+    fileurl_set = set(fileurl_list)
+    fieldid_set = set(fieldid_list)
+
+    print('Dowloading data...')
+    print('========== wget ==========')
+    for url_download in fileurl_set:
+        download_file_name = url_download.split('/')[-1]
+        # if os.path.isfile(download_file_name):
+        #     print(f'{download_file_name} already exists')
+        # else:
+        os.system('wget -c {}'.format(url_download))
+    print('======== wget done ========')
+
+    raw_path = 'erosita_data_raw'
+    new_path = 'erosita_data_new'
+
+    if os.path.isdir(raw_path):
+        os.system(f'rm -R {raw_path}')
+    os.mkdir(raw_path)
+    print('Extracting data...',end='')
+    for fieldid in fieldid_set:
+        os.system('tar -C erosita_data_raw -xzf {}.tar.gz'.format(fieldid))
+    print('done')
+    write_summary('Raw data are in erosita_data_raw\n')
+
+    if os.path.isdir(new_path):
+        os.system(f'rm -R {new_path}')
+    os.mkdir(new_path)
+    for obsid in OBS_DICT.keys():
+        os.system(f'find {raw_path} -name "*{obsid}*" -exec cp {{}} {new_path} \;')
+    write_summary("Data to reduce are in erosita_data_new\n")
+    print('Cone search and downloading finished!')
+
+def erosita_reduction():
+    '''
+    Data reduction modules including:
+    1. Merged events and image file generation
+    2. Exposure and PSF map generation
+    3. Source detection for the whole image and catalog generation
+    '''
+    os.chdir(FILEROOT)
+    if os.path.isfile(f'{OBSFILE}'):
+        os.remove(f'{OBSFILE}')
+    os.system(f'ls *EventList*.fits >> {OBSFILE}')
+    with open(f'{OBSFILE}', 'r') as fp:
+        obs_filename_list = [string.strip() for string in fp.readlines()]
+    global OBS_FILENAME_ALL
+    OBS_FILENAME_ALL = ' '.join(obs_filename_list)
+    print('======== evtool ========')
+    if len(obs_filename_list) > 1:
+        print('Create merged events file and image...')
+        os.system(f'evtool eventfiles="@{OBSFILE}" \
+                outfile="{EVENTFILE}" \
+                events=yes image=no emin={EMIN:.2f} emax={EMAX:.2f} \
+                clobber=yes')    
+    else:
+        print('Create events file and image...')
+        os.system(f'cp {obs_filename_list[0]} {EVENTFILE}')
+    
+    os.system(f'evtool eventfiles="@{OBSFILE}" \
+                outfile="{IMAGEFILE}" \
+                events=yes image=yes emin={EMIN:.2f} emax={EMAX:.2f} \
+                size="auto" rebin="80" clobber=yes')
+    print('====== evtool done ======')
+    write_summary(f'Events file: erosita_data_new/{EVENTFILE} \n')
+    write_summary(f'Image file: erosita_data_new/{IMAGEFILE} \n')
+    print('======== expmap ========')
+    print(f'Make exposure map between {EMIN:.1f} and {EMAX:.1f} keV...')
+    os.system(f'expmap inputdatasets="{EVENTFILE}" \
+                emin={EMIN:.2f} emax={EMAX:.2f} \
+                templateimage="{IMAGEFILE}" \
+                mergedmaps="{EXPFILE}"\
+                ')
+    print('====== expmap done ======')
+    write_summary(f'Exposure map: erosita_data_new/{EXPFILE} \n')
+
+    print('======== ermask ========')
+    print('Creating Detection mask...')
+    if os.path.isfile(DETMASK):
+        os.remove(DETMASK)
+    os.system(f'ermask expimage="{EXPFILE}" detmask="{DETMASK}"')
+    print('====== ermask done ======')
+
+    print('======== erbox ========')
+    check_exist(LOCALBOX)
+    os.system(f'erbox images="{IMAGEFILE}" boxlist="{LOCALBOX}" \
+                emin={1000*EMIN:.0f} emax={1000*EMAX:.0f} \
+                expimages="{EXPFILE}" detmasks="{DETMASK}" \
+                bkgima_flag=no ecf={ECF:.2e} \
+                likemin={LIKEMIN:.1f} boxsize=4 nruns=2\
+                ')
+    check_exist(BKGMAP)
+    check_exist(CHSMASK)
+    os.system(f'erbackmap image="{IMAGEFILE}" expimage="{EXPFILE}" \
+                boxlist="{LOCALBOX}" detmask="{DETMASK}" \
+                bkgimage="{BKGMAP}" \
+                emin={1000*EMIN:.0f} emax={1000*EMAX:.0f} \
+                cheesemask="{CHSMASK}"\
+                ')
+    check_exist(MAPBOX)
+    os.system(f'erbox images="{IMAGEFILE}" boxlist="{MAPBOX}" \
+                emin={1000*EMIN:.0f} emax={1000*EMAX:.0f} \
+                expimages="{EXPFILE}" detmasks="{DETMASK}" \
+                bkgimages="{BKGMAP}" \
+                bkgima_flag=yes ecf={ECF:.2e} \
+                likemin={LIKEMIN:.1f} boxsize=4 nruns=2\
+                ')
+    print('A primary source list has been generated.')
+    print('====== erbox done ======')
+
+    print('======== ermldet ========')
+    # Note that extentmodel can be either Gaussian or Beta
+    # See more for the command introduction
+    print('Generating source catalog...')
+    os.system(f'ermldet mllist="{MLFILE}" boxlist="{MAPBOX}" \
+                images="{IMAGEFILE}" expimages="{EXPFILE}" \
+                detmasks="{DETMASK}" bkgimages="{BKGMAP}" \
+                extentmodel="{EXTENTMODEL}" srcimages="{SRCIMAGE}" \
+                emin={1000*EMIN:.0f} emax={1000*EMAX:.0f} \
+                ecf={ECF:.2e} likemin={LIKEMIN:.1f}')
+    os.system(f'catprep infile="{MLFILE}" outfile="{CATALOG}"')
+    write_summary(f'Source catalog: erosita_data_new/{CATALOG} \n')
+    print("====== ermldet done ======")
+    print('Writing source region file...')
+    src_table = Table.read(f'{MLFILE}')
+    src_table = src_table[(src_table["ID_INST"]==1)&(src_table["ID_BAND"]==1)]
+    src_ra_array, src_dec_array = np.array(src_table['RA']), np.array(src_table['DEC'])
+    with open('source.reg', 'w+') as fp:
+        fp.write('fk5\n')
+        for idx in range(len(src_ra_array)):
+            fp.write(f'circle({src_ra_array[idx]}, {src_dec_array[idx]}, {DETERR}")\n')
+    write_summary(f'Source region file: erosita_data_new/source.reg \n')
+    
+
+def erosita_psfmap():
+    '''
+    PSF map generation
+    '''
+    os.chdir(FILEROOT)
+    print('======== apetool ========')
+    print('Generating PSF and sensitivity map...')
+    os.system(f'apetool images="{IMAGEFILE}" psfmaps="{PSFFILE}" \
+                psfmapflag="yes" ')
+    os.system(f'apetool images="{IMAGEFILE}" expimages="{EXPFILE}" \
+                bkgimages="{BKGMAP}" psfmaps="{PSFFILE}" srcimages="{SRCIMAGE}" \
+                detmasks="{DETMASK}" apesenseimages="{SENSITIVITYMAP}" \
+                apesenseflag=yes pthresh=4e-6 eefextract=0.65')
+    print('====== apetool done ======')
+    print('Data reduction finished.')
+    write_summary(f'PSF map: erosita_data_new/{PSFFILE} \n')
+
+def erosita_photometry(RA, DEC, mode='single'):
+    '''
+    Do photometry for individual sources.
+    The lower and upper limits are then calculated by astropy.stat.poisson_conf_interval.
+    '''
+    os.chdir(FILEROOT)
+    global POINTSOURCE, RA_PHO, DEC_PHO
+    if mode == 'single':        
+        src_table = Table.read(f'{MLFILE}')
+        src_table = src_table[(src_table["ID_INST"]==1)&(src_table["ID_BAND"]==1)]
+        target_coord = SkyCoord(ra=RA, dec=DEC, frame='icrs', unit='deg')
+        source_coord = SkyCoord(ra=np.array(src_table['RA']), dec=np.array(src_table['DEC']), frame='icrs', unit='deg')
+        src_distance = target_coord.separation(source_coord)
+        distance_min, distance_argmin = src_distance.min().to(u.arcsec).value, src_distance.argmin()
+        if distance_min <= DETERR:
+            print(f'Source found in {DETERR}arcsec.')
+            RA_PHO, DEC_PHO = src_table['RA'][distance_argmin], src_table['DEC'][distance_argmin]
+            POINTSOURCE = True
+            print(f'Do photometry for the nearest source ra={RA_PHO:.5f}, dec={DEC_PHO:.5f} in {EMIN:.1f}-{EMAX:.1f} keV...')
+        if distance_min > DETERR:
+            print(f'No source found in {DETERR}arcsec.')
+            RA_PHO, DEC_PHO = RA, DEC
+            POINTSOURCE = False
+            print(f'Do photometry for the give coordinate ra={RA}, dec={DEC} in {EMIN:.1f}-{EMAX:.1f} keV...')
+        check_exist(APEOUT_SINGLE)
+        check_exist(APEOUT_SINGLE)
+        # Note that APEIN_SINGLE extension should be named "Joined"
+        ra_array = np.array([RA_PHO])
+        dec_array = np.array([DEC_PHO])
+        re_array = np.array([0.65])
+        rr_array = np.array([0.95])
+        t = QTable([ra_array, dec_array, re_array, rr_array],
+                    names=('RA', 'DEC', 'RE', 'RR'),
+                    meta={'EXTNAME':'Joined'})
+        t.write(f'{APEIN_SINGLE}', overwrite=True)
+        os.system(f'apetool mllist="{MLFILE}" apelist="{APEIN_SINGLE}" apelistout="{APEOUT_SINGLE}" \
+                    images="{IMAGEFILE}" expimages="{EXPFILE}" \
+                    bkgimages="{BKGMAP}" psfmaps="{PSFFILE}" \
+                    srcimages="{SRCIMAGE}" detmasks="{DETMASK}" \
+                    emin={1000*EMIN:.0f} emax={1000*EMAX:.0f} eindex="1" eefextract=0.65 \
+                    psfmapflag=no apexflag=no stackflag=yes \
+                    ')
+        write_summary(f'Photometry output: erosita_data_new/{APEOUT_SINGLE} \n')
+    elif mode == 'all':
+        print(f'Do photometry for all source in {EMIN:.1f}-{EMAX:.1f} keV...')
+        POINTSOURCE = False
+        os.system(f'apetool mllist="{MLFILE}" apelistout="{APEOUT_ALL}" \
+                    images="{IMAGEFILE}" expimages="{EXPFILE}" \
+                    bkgimages="{BKGMAP}" psfmaps="{PSFFILE}" \
+                    srcimages="{SRCIMAGE}" detmasks="{DETMASK}" \
+                    emin={1000*EMIN:.0f} emax={1000*EMAX:.0f} eindex="1" eefextract=0.65 \
+                    psfmapflag=no apexflag=yes stackflag=no  \
+                    ')
+        write_summary(f'Photometry output: erosita_data_new/{APEOUT_SINGLE} \n')
+
+def erosita_extraction_region(ra, dec, psf=75):
+    '''
+    Extract source and background regions with contamination excluded.
+    '''
+    t = Table.read(CATALOG)
+    ra_array, dec_array = np.array(t['RA']), np.array(t['DEC'])
+    # coordinates transformation and interpolate psf map
+    hdu_iamge = fits.open(IMAGEFILE)
+    hdu_psf = fits.open(PSFFILE)
+    psf_index = int((psf - 45)/5)
+    psf_map = hdu_psf[0].data[psf_index]
+    w = WCS(hdu_iamge[0].header)
+    y_pixel_max, x_pixel_max = w.array_shape
+    x_edges, y_edges = np.mgrid[0:x_pixel_max:22j, 0:y_pixel_max:22j]
+    x_center = (x_edges[1:, 1:] + x_edges[:-1, :-1])/2
+    y_center = (y_edges[1:, 1:] + y_edges[:-1, :-1])/2
+    rbf = Rbf(x_center, y_center, psf_map, epsilon=2)
+    target_world_coord = SkyCoord(ra, dec, frame='icrs', unit='deg')
+    target_pixel_coord = w.world_to_pixel(target_world_coord)
+    # events pixel 0.05", bin80 so that image file has 4.0" per pixel
+    psf_value_arcsec = rbf(target_pixel_coord[0], target_pixel_coord[1])*4.
+    src_radius = psf_value_arcsec
+    bkg_inner_radius = 2*psf_value_arcsec
+    bkg_outer_radius = 5*psf_value_arcsec
+    # search for contamination
+    src_array = SkyCoord(ra_array, dec_array, frame='icrs', unit='deg')   
+    dist_array = target_world_coord.separation(src_array)
+    contam_condition = np.where((dist_array>bkg_inner_radius*u.arcsec)&(dist_array<bkg_outer_radius*u.arcsec))
+    ra_contam, dec_contam = ra_array[contam_condition], dec_array[contam_condition]
+    # write source and background region
+    global SRCREG, BKGREG
+    SRCREG = SRCREG.format(psf)
+    BKGREG = BKGREG.format(psf)
+    with open(SRCREG, 'w+') as fp:
+        fp.write(f'icrs; circle {ra} {dec} {src_radius}"\n')
+    with open(BKGREG, 'w+') as fp:
+        fp.write(f'icrs; annulus {ra} {dec} {bkg_inner_radius}" {bkg_outer_radius}"\n')
+        for idx in range(ra_contam.size):
+            fp.write(f'icrs; -circle {ra_contam[idx]} {dec_contam[idx]} {psf_value_arcsec}"\n')
+    
+def erosita_lightcurve(ra, dec):
+    '''
+    Extract light curve for the detected source and plot.
+    '''
+    os.chdir(FILEROOT)
+    print('Extract light curve...')
+    if OBS_FILENAME_ALL:
+        obs_filename_list = OBS_FILENAME_ALL.split(' ')
+    else:
+        with open(f'{OBSFILE}', 'r') as fp:
+            obs_filename_list = [string.strip() for string in fp.readlines()]
+    
+    for idx, event in enumerate(obs_filename_list):
+        hdu = fits.open(event)[0].header
+        tstart, tstop = float(hdu['TSTART']), float(hdu['TSTOP'])
+        tstep = (tstop - tstart)/50.
+        print('======= srctool =======')
+        os.system(f'srctool eventfiles="{event}" srccoord="icrs;{ra},{dec}" \
+                    prefix="lc/lc_" suffix="_v{idx+1}" \
+                    todo="LC LCCORR" insts="1 2 3 4 5 6 7" \
+                    srcreg="{SRCREG}" backreg="{BKGREG}" exttype="POINT" lctype="REGULAR-" \
+                    lcemin={EMIN:.2f} lcemax={EMAX:.2f} \
+                    lcpars="{tstep}" gtitype="FLAREGTI" psftype="2D_PSF" clobber=yes \
+                    ')
+        print('===== srctool done =====')
+    # Plot light curve
+    os.chdir(LCROOT)
+    check_exist(LC_LIST)
+    os.system(f'ls lc_0*LightCurve*.fits >> {LC_LIST}')
+    with open(LC_LIST) as fp:
+        lc_list = [line.strip() for line in fp.readlines()]
+        for idx,lc in enumerate(lc_list):
+            obsID = obs_filename_list[int(lc[-6])-1].split('_')[1]
+            lc_t0 = Table.read(lc)
+            plt.figure(figsize=(8,6), dpi=320)
+            plt.subplots_adjust(left=0.15, right=0.95, bottom=0.15, top=0.95)
+            plt.errorbar((lc_t0['TIME'] - lc_t0['TIME'][0])/1000.,
+                            lc_t0['RATE'].T,
+                            yerr=lc_t0['RATE_ERR'].T,
+                            marker="o", 
+                            color="C3", 
+                            mfc="black",
+                            mec="black",
+                            zorder=2,
+                            label=f'ObsID. {obsID}'
+                            )
+            plt.legend(prop={"weight":'bold', "size":12},
+		          markerscale=1,
+		          edgecolor='black')
+            plt.xlabel(r'$t-t_0~[{\rm ks}]$')
+            plt.ylabel(r'${\rm Net~Count~Rate~[cts~s^{-1}]}$')
+            plt.savefig(f"{lc.split('.')[0]}.pdf", format='pdf')
+            write_summary(f"Light curve for ObsID. {obsID}: erosita_data_new/lc/{lc.split('.')[0]}.pdf \n")
+
+def erosita_spectrum(ra, dec):
+    '''
+    Extract spectrum from the detected source and fit by Xspec.
+    '''
+    os.chdir(FILEROOT)
+    print('Extract spectrum...')
+    global OBS_FILENAME_ALL
+    if not OBS_FILENAME_ALL:
+        with open(f'{OBSFILE}', 'r') as fp:
+            obs_filename_list = [string.strip() for string in fp.readlines()]
+            OBS_FILENAME_ALL = ' '.join(obs_filename_list)
+    print('======= srctool =======')
+    os.system(f'srctool eventfiles="{OBS_FILENAME_ALL}" srccoord="icrs;{ra},{dec}" \
+                prefix="spectrum/spec_" suffix="_v1" \
+                todo="SPEC ARF RMF" insts="1 2 3 4 5 6 7" \
+                srcreg="{SRCREG}" backreg="{BKGREG}" exttype="POINT" lctype="REGULAR-" \
+                gtitype="GTI" psftype="2D_PSF" clobber=yes \
+                ')
+    print('===== srctool done =====')
+    # bin the spectrum with ftgrouppha
+    os.chdir(SPECROOT)
+    os.system('rm source_spec.txt')
+    os.system('ls spec_0*_SourceSpec*.fits >> source_spec.txt')
+    with open('source_spec.txt', 'r+') as fp:
+        source_spec_list = fp.readlines()
+        if len(source_spec_list) < 1:
+            print('Merged source spectrum not found.')
+            return None
+        else:
+            global SPEC_SRC_RAW
+            SPEC_SRC_RAW = source_spec_list[0].strip()
+            spec_header = fits.open(SPEC_SRC_RAW)[1].header
+            spec_bkg_path = spec_header['BACKFILE'].strip()
+            spec_rmf_path = spec_header['RESPFILE'].strip()
+            spec_arf_path = spec_header['ANCRFILE'].strip()
+    rmf = Table.read(spec_rmf_path, hdu=2)
+    elow = np.array(rmf['E_MIN'])
+    global MINCHANNEL, MAXCHANNEL
+    MINCHANNEL = np.where(elow > EMIN)[0].min()
+    MAXCHANNEL = np.where(elow > EMAX)[0].min()
+    os.system(f'ftgrouppha infile={SPEC_SRC_RAW} backfile={spec_bkg_path} \
+                outfile={SPEC_SRC_BINNED} respfile={spec_rmf_path} grouptype="snmin" groupscale="{SNR_MIN_BIN}" \
+                minchannel="{MINCHANNEL}" maxchannel="{MAXCHANNEL}" clobber=yes')
+    write_summary(f'Merged source spectrum: erosita_data_new/spectrum/{SPEC_SRC_RAW} \n')
+    write_summary(f'Merged binned source spectrum: erosita_data_new/spectrum/{SPEC_SRC_BINNED} \n')
+    # write .xcm for Xspec
+    global FITSCRIPT
+    for index, model in enumerate(MODEL):
+        # scritp, log, and figure all named fit_model+index+.xcm or .log or .ps
+        fit_script_file = f'fit_model{index+1}.xcm'
+        FITSCRIPT.append(fit_script_file)
+        os.system(f'rm {fit_script_file.split(".")[0]}*')
+        with open(fit_script_file, 'w+') as fp:
+            fp.write(
+f'''data {SPEC_SRC_BINNED}
+ig **-0.2
+ig 5.-**
+abund wilm
+query yes
+model {model}
+{MODEL_PARAMETER[index]}
+log {fit_script_file.split(".")[0]}.log
+fit
+err 2.706 1 2
+log none
+setp en
+setp comm time off
+setp comm label top {model}
+pl
+setp device {fit_script_file.split(".")[0]}.ps/cps
+pl ld del
+save all {fit_script_file.split(".")[0]}_result.xcm
+exit
+''')
+        os.system(f'xspec - {fit_script_file}')
+        write_summary(f"=========== MODEL{index+1}: {model} ===========\n")
+        write_summary(f"Spectrum plot {fit_script_file.split('.')[0]}.ps/cps \n")
+        write_summary(f'=========== MODEL{index+1}: Fit log =========== \n')
+        os.system(f'cat {fit_script_file.split(".")[0]}.log >> {SUMMARY}')
+        write_summary('=========== Fit log end =========== \n')
+
+if __name__ == "__main__":  
+    parser = ArgumentParser(description='''eRosita data reduction and analysis pipeline''', prog='erosita_pipeline')
+    parser.add_argument("ra", type=float, help="Input R.A. value in degree")
+    parser.add_argument("dec", type=float, help="Input Dec value in degree")
+    parser.add_argument("--without-download", action="store_false", dest="nodownload", help="**Forbid** erosita_download. You may not need to download and extract file once more, as extraction will empty erosita_data_new file.")
+    parser.add_argument("--without-reduction", action="store_false", dest='noreduction', help="**Forbid** erosita_reduction. You may not need to do reduction once more, as reduction consumes much time. It will also prevent erosita_download.")
+    parser.add_argument("--photmode", dest='photmode', choices=['single', 'all'], help="Do photometry for single source or all detected sources. Default 'single'.")
+    # parser.add_argument("--specmodel", dest='specmodel', metavar="spectral model", help="Xspec fit model string (comma-separated). Note that you should input fit parameters in Xpsec manually.")
+    
+    
+    # INITIAL
+    RA = None
+    DEC = None
+    # REDUCTION PATH
+    OBSFILE = "obs.ls"
+    FILEROOT = f"{os.getcwd()}/erosita_data_new"
+    EVENTFILE = "event_merge.fits"
+    IMAGEFILE = "image_merge.fits"
+    EXPFILE = "output_expmap.fits"
+    PSFFILE = "output_psfmap.fits"
+    DETMASK = "detmask.fits"
+    LOCALBOX = "boxlist_local.fits"
+    MAPBOX = "boxlist_map.fits"
+    BKGMAP = "bkg_map.fits"
+    CHSMASK = "cheesemask.fits"
+    MLFILE = "mllist.fits"
+    APEOUT_ALL = "mllist_ape.fits"
+    APEIN_SINGLE = "ape_in.fits"
+    APEOUT_SINGLE = "ape_out.fits"
+    SRCIMAGE = "sourceimages.fits"
+    CATALOG = "catalog.fits"
+    SENSITIVITYMAP = "output_sensimap.fits"
+    OBS_DICT = None
+
+    # PHOTOMETRY AND SPECTRUM
+    EXTENTMODEL = "beta"
+    SPECROOT = f"{FILEROOT}/spectrum"
+    LCROOT = f"{FILEROOT}/lc"
+    LC_LIST = "lc.lis"
+    SRCREG = "src_psf{}.reg"
+    BKGREG = "bkg_psf{}.reg"
+    OBS_FILENAME_ALL = None
+    POINTSOURCE = None
+    RA_PHO, DEC_PHO = None, None
+    PHOTMODE = "single"
+    FITSCRIPT = []
+    MODEL = ["tbabs*powerlaw", "tbabs*(powerlaw+apec)"]
+    MODEL_PARAMETER = ['''      0.615062      0.001          0          0     100000      1e+06
+        5.02132       0.01         -3         -2          9         10
+        4.2329e-05       0.01          0          0      1e+20      1e+24'''
+    ,'''       0.148922      0.001          0          0     100000      1e+06
+        2.77042       0.01         -3         -2          9         10
+    7.80065e-06       0.01          0          0      1e+20      1e+24
+        0.836265       0.01      0.008      0.008         64         64
+                1     -0.001          0          0          5          5
+                0      -0.01     -0.999     -0.999         10         10
+        8.6509e-06       0.01          0          0      1e+20      1e+24''']
+    SPEC_SRC_RAW = None
+    SPEC_SRC_BINNED = "spec_merged_binned.pha"
+
+    # QUANTITY PARAMETERS
+    EMIN = 0.2
+    EMAX = 5.0
+    ECF = 1.e12
+    LIKEMIN = 6.0
+    DETERR = 30
+    SNR_MIN_BIN = 2
+    MINCHANNEL = None # 20 for 0.2 keV
+    MAXCHANNEL = None # 561 for 5.0 keV
+
+    # SUMMARY
+    SUMMARY = f"{os.getcwd()}/summary.txt"
+
+    # PLOT PARAMETERS
+    plt.rcParams["axes.labelsize"] = 24
+    plt.rcParams["xtick.labelsize"] = 16
+    plt.rcParams["ytick.labelsize"] = 16
+    plt.rcParams["font.family"] = "Times New Roman"
+    plt.rcParams["mathtext.fontset"] = "stix" 
+    plt.rcParams["axes.grid.which"] = "both"
+    plt.rcParams["axes.linewidth"] = 1.0
+    plt.rcParams["xtick.direction"] = 'in'
+    plt.rcParams["ytick.direction"] = 'in'
+    plt.rcParams["ytick.minor.visible"] = True
+    plt.rcParams["xtick.minor.visible"] = True
+    plt.rcParams['xtick.major.size'] = 4.5
+    plt.rcParams['xtick.minor.size'] = 2.5
+    plt.rcParams['xtick.major.width'] = 1.0
+    plt.rcParams['xtick.minor.width'] = 0.8
+    plt.rcParams['ytick.major.size'] = 4.5
+    plt.rcParams['ytick.minor.size'] = 2.5
+    plt.rcParams['ytick.major.width'] = 1.0
+    plt.rcParams['ytick.minor.width'] = 0.8
+
+    args = parser.parse_args()
+    RA, DEC = args.ra, args.dec
+    check_exist(SUMMARY)
+    # either --without-download or --without-reduction can forbid download
+    if args.nodownload and args.noreduction:
+        erosita_download(RA, DEC)
+    if args.noreduction:
+        erosita_reduction()
+    if not os.path.isdir(FILEROOT) or not os.path.isfile(f'{FILEROOT}/event_merge.fits'):
+        sys.exit('Please not use --without-download and --without-reduction for first time.')
+    erosita_psfmap()
+    if args.photmode:
+        PHOTMODE = args.photmode
+    erosita_photometry(RA, DEC)
+    if POINTSOURCE:
+        erosita_extraction_region(RA_PHO, DEC_PHO)
+        erosita_lightcurve(RA_PHO, DEC_PHO)
+        erosita_spectrum(RA_PHO, DEC_PHO)
+    else:
+        write_summary("No source found near the given coordinate to extract light curve and spectrum. \n")
