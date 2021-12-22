@@ -21,6 +21,13 @@ Data reduction and analysis:
 3. exposure and PSF map generation
 4. light curve and spectrum extraction and analysis
 
+## Requirement
+eSASS: https://erosita.mpe.mpg.de/edr/DataAnalysis/esassinstall.html
+
+python library: astropy, scipy, numpy
+
+You can use docker to obtain complete system: see https://hub.docker.com/r/suzhao/erpl or "docker pull suzhao/erpl:latest"
+
 ## Usage
 1. ./erosita\_pipeline --help to get infomation of arguments
 2. ./erosita\_pipeline ra dec: Download data and run all tasks
