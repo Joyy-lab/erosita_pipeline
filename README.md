@@ -25,6 +25,7 @@ Data reduction:
 2. erosita_pipeline ra dec
 
 Download data and reduce
+
 3. erosita_pipeline ra dec --without-reduction
 
 Forbid reduction and download 
