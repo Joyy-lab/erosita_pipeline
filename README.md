@@ -1,8 +1,4 @@
-<<<<<<< HEAD:README
 #eROSITA Data Analysis Pipeline
-=======
-# eRosita data reduction pipeline
->>>>>>> 63726b190d1c4becbba370f6a15905365a6fa96d:README.md
 ## Introduction
 Download erosita data:
 
@@ -26,17 +22,6 @@ Data reduction and analysis:
 4. light curve and spectrum extraction and analysis
 
 ## Usage
-<<<<<<< HEAD:README
-1. erosita\_pipeline --help to get infomation of arguments
-2. erosita\_pipeline ra dec: Download data and run all tasks
-3. erosita\_pipeline ra dec --without-reduction: Forbid reduction and download 
-=======
 1. ./erosita\_pipeline --help to get infomation of arguments
-2. ./erosita\_pipeline ra dec
-
-Download data and reduce
-
-3. ./erosita\_pipeline ra dec --without-reduction
-
-Forbid reduction and download 
->>>>>>> 63726b190d1c4becbba370f6a15905365a6fa96d:README.md
+2. ./erosita\_pipeline ra dec: Download data and run all tasks
+3. ./erosita\_pipeline ra dec --without-reduction: Forbid reduction and download 
