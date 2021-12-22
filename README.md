@@ -1,4 +1,4 @@
-# erosita data reduction pipeline
+# eRosita data reduction pipeline
 ## Introduction
 Download erosita data:
 
@@ -6,9 +6,9 @@ cone search example: https://sciserver.mpe.mpg.de/erosita-services/conesearch/ob
 
 ra, dec must in degree
 
-set cone radius to 0.01 and unit of arcsec. So that the target would definitely be covered.
+Set cone radius to 0.01 and unit of arcsec. So that the target would definitely be covered.
 
-note that ra, dec for website have maximum four float digits.
+Note that ra, dec for website have maximum four float digits.
 
 Response:
 
